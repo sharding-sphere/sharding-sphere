@@ -20,6 +20,7 @@ package org.apache.shardingsphere.infra.metadata.schema.builder;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.shardingsphere.infra.database.type.DatabaseType;
 import org.apache.shardingsphere.infra.exception.ShardingSphereException;
 import org.apache.shardingsphere.infra.metadata.schema.builder.loader.ColumnMetaDataLoader;
@@ -36,6 +37,7 @@ import org.apache.shardingsphere.infra.spi.ShardingSphereServiceLoader;
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -85,12 +87,27 @@ public final class SchemaBuilder {
     private static Map<String, TableMetaData> buildActualTableMetaDataMap(final SchemaBuilderMaterials materials) throws SQLException {
         Map<String, TableMetaData> result = new HashMap<>(materials.getRules().size(), 1);
         appendRemainTables(materials, result);
-        for (ShardingSphereRule rule : materials.getRules()) {
-            if (rule instanceof TableContainedRule) {
-                for (String table : ((TableContainedRule) rule).getTables()) {
-                    if (!result.containsKey(table)) {
-                        TableMetaDataBuilder.load(table, materials).map(optional -> result.put(table, optional));
+
+        // Append more tables in 'TableContainedRule' by multi-thread
+        Collection<String> toAppendLoadTables = materials.getRules().stream()
+                .filter(rule -> rule instanceof TableContainedRule)
+                .flatMap(rule -> ((TableContainedRule) rule).getTables().stream())
+                .filter(table -> !result.containsKey(table))
+                .collect(Collectors.toSet());
+
+        if (CollectionUtils.isNotEmpty(toAppendLoadTables)) {
+            Collection<Future<Optional<TableMetaData>>> futures = new ArrayList<>(toAppendLoadTables.size());
+            for (String table : toAppendLoadTables) {
+                futures.add(EXECUTOR_SERVICE.submit(() -> TableMetaDataBuilder.load(table, materials)));
+            }
+            for (Future<Optional<TableMetaData>> each : futures) {
+                try {
+                    each.get().map(optional -> result.put(optional.getName(), optional));
+                } catch (final InterruptedException | ExecutionException ex) {
+                    if (ex.getCause() instanceof SQLException) {
+                        throw (SQLException) ex.getCause();
                     }
+                    throw new ShardingSphereException(ex);
                 }
             }
         }
@@ -131,10 +148,10 @@ public final class SchemaBuilder {
     }
     
     private static void appendDialectRemainTables(final DialectTableMetaDataLoader dialectLoader, final SchemaBuilderMaterials materials, final Map<String, TableMetaData> tables) throws SQLException {
+        Collection<String> existedTableNames = getExistedTables(materials.getRules(), tables);
         Collection<Future<Map<String, TableMetaData>>> futures = new LinkedList<>();
-        Collection<String> existedTables = getExistedTables(materials.getRules(), tables);
         for (DataSource each : materials.getDataSourceMap().values()) {
-            futures.add(EXECUTOR_SERVICE.submit(() -> dialectLoader.load(each, existedTables)));
+            futures.add(EXECUTOR_SERVICE.submit(() -> dialectLoader.load(each, existedTableNames)));
         }
         for (Future<Map<String, TableMetaData>> each : futures) {
             try {
